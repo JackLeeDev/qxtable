@@ -17,15 +17,15 @@ local weak_meta = {__mode = "v"}
 local _M = {}
 
 local function wrap_root(name, ud)
-    return setmetatable({__ud = assert(ud)}, meta)
+    return setmetatable({__xt = assert(ud), __name = name}, meta)
 end
 
 local function wrap_table(ud)
-    return setmetatable({__ud = assert(ud)}, meta)
+    return setmetatable({__xt = assert(ud)}, meta)
 end
 
 local function qxtable_next(t, k)
-    local nextk,nextv,nextud = c_next(t.__ud, k)
+    local nextk,nextv,nextud = c_next(t.__xt, k)
     if nextud then
         return nextk,t[nextk]
     else
@@ -34,7 +34,7 @@ local function qxtable_next(t, k)
 end
 
 meta.__index = function(t, k)
-    local v,ud = c_index(t.__ud, k)
+    local v,ud = c_index(t.__xt, k)
     if ud then
         local value = wrap_table(ud)
         rawset(t, k, value)
@@ -49,7 +49,7 @@ meta.__newindex = function(t, k, v)
 end
 
 meta.__len = function(t)
-    return c_len(t.__ud)
+    return c_len(t.__xt)
 end
 
 meta.__pairs = function(t)
@@ -65,10 +65,10 @@ for k,v in pairs(meta) do
 end
 
 function _M.reload()
-    local ud_list = c.listtables()
+    local ud_list = c.reload()
     for name,ud in pairs(ud_list) do
         local cache = cache_tables[name]
-        if not cache or cache.__ud ~= ud then
+        if not cache or cache.__xt ~= ud then
             cache_tables[name] = wrap_root(name, ud)
         end
     end
@@ -78,8 +78,18 @@ function _M.find(name)
     return cache_tables[name]
 end
 
-function _M.update(name_tbs)
-    c.update(name_tbs)
+function _M.update(confs)
+    assert(type(confs) == "table")
+    for name,conf in pairs(confs) do
+        assert(type(name) == "string")
+        assert(type(conf) == "table")
+    end
+    c.update(confs)
+end
+
+function _M.md5(t)
+    local md5 = require "md5"
+    return md5.sumhexa(c.tostring(t.__xt))
 end
 
 function _M.memory()
