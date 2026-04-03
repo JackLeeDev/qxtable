@@ -8,6 +8,8 @@
 #include <lua.h>
 #include <lauxlib.h>
 #include "qlock.h"
+#include "qbuf.h"
+#include "qbarray.h"
 
 #define QXT_TNIL 0
 #define QXT_TINTEGER 1
@@ -26,21 +28,21 @@
 #define get_kv_type(tb, idx) (*((uint8_t*)tb-(idx+1)))
 #define get_kv_typep(tb, idx) ((uint8_t*)tb-(idx+1))
 #define get_table_raw_ptr(tb) (void*)((uint8_t*)tb - tb->size)
-#define get_table_node_element(tb, idx)  (&(((table_node*)((tb)+1))[idx]))
-#define get_table_array_element(tb, idx) (&(((table_value*)((tb)+1))[idx]))
+#define get_table_node_element(tb, idx)  (&(((qxtable_node*)((tb)+1))[idx]))
+#define get_table_array_element(tb, idx) (&(((qxtable_value*)((tb)+1))[idx]))
 #define get_table_i32array_element(tb, idx) (&(((int32_t*)((tb)+1))[idx]))
 
-typedef struct table_value {
+typedef struct qxtable_value {
 	union {
 		int64_t iv;
 		double dv;
 		bool bv;
 		const char* sv;
-		struct table* tv;
+		struct qxtable* tv;
 	};
-} table_value;
+} qxtable_value;
 
-typedef struct table_node {
+typedef struct qxtable_node {
 	union {
 		int64_t ik;
 		const char* sk;
@@ -50,43 +52,46 @@ typedef struct table_node {
 		double dv;
 		bool bv;
 		const char* sv;
-		struct table* tv;
+		struct qxtable* tv;
 	};
-} table_node;
+} qxtable_node;
 
-typedef struct table {
+typedef struct qxtable {
 	// flexible array, stores element type data
 	uint8_t tt : 2;
 	uint32_t size : 30;
 	// flexible array, stores element data
-} table;
+} qxtable;
 
 typedef struct config {
 	const char* name;
-	table* tb;
+	qxtable* tb;
 	struct config* next;
 } config;
 
-typedef struct table_hnode {
-	uint32_t* hash;
-	table** array;
-	int32_t size;
-	int32_t cap;
-} table_hnode;
+typedef struct qxtable_hnode {
+	qbarray harray;
+	qbarray array;
+} qxtable_hnode;
 
 typedef struct string_node {
-	const char** array;
-	int32_t size;
-	int32_t cap;
+	qbarray array;
 	rwlock_t lock;
 } string_node;
+
+typedef struct tostring_encoder {
+	char* buffer;
+	int32_t cap;
+	int32_t write_ptr;
+} tostring_encoder;
 
 typedef struct config_context {
 	config* cfg;
 	string_node str_hnode[STRING_HNODE_SIZE];
-	table_hnode table_hnode[TABLE_HNODE_SIZE];
+	qxtable_hnode qxtable_hnode[TABLE_HNODE_SIZE];
 	size_t mem_size;
 	spinlock_t lock;
+	bool inited;
 } config_context;
 
 static config_context g_ctx;
@@ -115,30 +120,12 @@ static inline const char* qxtable_strdup(const char* str, size_t len) {
 
 static inline uint32_t string_hash(const char *str, size_t len) {
     uint32_t h = 0x811c9dc5;
-    int32_t i;
+    uint32_t i;
     for (i = 0; i < len; i++) {
         h ^= (uint32_t)(uint8_t)str[i];
         h *= 0x01000193;
     }
     return h;
-}
-
-static  inline int32_t string_index(string_node* node, const char* str, int32_t* ins_idx) {
-	int32_t left = 0;
-	int32_t right = node->size - 1;
-	while (left <= right) {
-		int32_t middle = (left + right) / 2;
-		int32_t ret = strcmp(str, node->array[middle]);
-		if (ret < 0)
-			right = middle - 1;
-		else if (ret == 0)
-			return middle;
-		else 
-			left = middle + 1;
-	}
-	if (ins_idx)
-		*ins_idx = left;
-	return -1;
 }
 
 static const char* string_cache(const char* str) {
@@ -150,41 +137,24 @@ static const char* string_cache(const char* str) {
 	rwlock_t* lock = &node->lock;
 
 	rwlock_rlock(lock);
-		int32_t idx = string_index(node, str, NULL);
+		int32_t idx = qbarray_indexof(&node->array, &str);
 		if (idx >= 0) {
-			const char* cache_str = node->array[idx];
+			str = *(const char**)qbarray_get(&node->array, idx);
 			rwlock_runlock(lock);
-			return cache_str;
+			return str;
 		}
 	rwlock_runlock(lock);
 
 	rwlock_wlock(lock);
-		int32_t elem_size = sizeof(*node->array);
-		if (node->size  >= node->cap) {
-			int32_t old_cap = node->cap;
-			node->cap += 2;
-			node->array = qxtable_realloc(node->array, old_cap*elem_size, node->cap*elem_size);
-		}
-
-		int32_t ins_idx = -1;
-		idx = string_index(node, str, &ins_idx);
-		assert(idx == -1);
-		assert(ins_idx >= 0);
-
-		int32_t move_size = node->size - ins_idx;
-		if (move_size > 0) {
-			memmove(&node->array[ins_idx+1], &node->array[ins_idx], move_size*elem_size);
-		}
-		++node->size;
-
-		const char* new_str = qxtable_strdup(str, len);
-		node->array[ins_idx] = new_str;
+		str = qxtable_strdup(str, len);
+		bool ok = qbarray_insert(&node->array, &str);
+		assert(ok);
 	rwlock_wunlock(lock);
 
-	return new_str;
+	return str;
 }
 
-static inline int32_t get_current_size(table* tb) {
+static inline int32_t get_current_size(qxtable* tb) {
 	int32_t i;
 	int32_t size = 0;
 	for (i = 0; i < tb->size; ++i) {
@@ -220,7 +190,7 @@ static inline int32_t table_info(lua_State *L, uint8_t* tt) {
 	return size;
 }
 
-static inline uint8_t get_key_type_by_index(table* tb, int32_t idx) {
+static inline uint8_t get_key_type_by_index(qxtable* tb, int32_t idx) {
 	assert(idx >= 0 && idx < tb->size);
 	if (tb->tt == QXT_TT_MAP) {
 		uint8_t type = get_kv_type(tb, idx);
@@ -231,7 +201,7 @@ static inline uint8_t get_key_type_by_index(table* tb, int32_t idx) {
 	}
 }
 
-static inline uint8_t get_key_by_index(table* tb, int32_t idx, int64_t* ik, const char** sk) {
+static inline uint8_t get_key_by_index(qxtable* tb, int32_t idx, int64_t* ik, const char** sk) {
 	int32_t tk = get_key_type_by_index(tb, idx);
 	assert(tk != QXT_TNIL);
 	if (tb->tt == QXT_TT_MAP) {
@@ -249,17 +219,12 @@ static inline uint8_t get_key_by_index(table* tb, int32_t idx, int64_t* ik, cons
 	return tk;
 }
 
-static inline uint8_t get_value_type_by_index(table* tb, int32_t idx) {
+static inline uint8_t get_value_type_by_index(qxtable* tb, int32_t idx) {
 	uint8_t type = get_kv_type(tb, idx);
-	if (tb->tt == QXT_TT_MAP) {
-		return type & 15;
-	}
-	else {
-		return type;
-	}
+	return tb->tt==QXT_TT_MAP ? (type&0xF) : type;
 }
 
-static uint8_t get_value_by_index(table* tb, int32_t idx, table_value* value) {
+static uint8_t get_value_by_index(qxtable* tb, int32_t idx, qxtable_value* value) {
 	if (idx < 0 || idx >= tb->size) {
 		return QXT_TNIL;
 	}
@@ -289,7 +254,7 @@ static inline int32_t key_compare(int64_t ik1, const char* sk1, int64_t ik2, con
 	}
 }
 
-static int32_t _map_field_index(table* tb, int64_t ik, const char* sk, int32_t* ins_idx, bool insert) {
+static int32_t _map_field_index(qxtable* tb, int64_t ik, const char* sk, int32_t* ins_idx, bool insert) {
 	assert(tb->tt == QXT_TT_MAP);
 	int32_t left = 0;
 	int32_t right = !insert ? (tb->size-1) : (get_current_size(tb) - 1);
@@ -311,7 +276,7 @@ static int32_t _map_field_index(table* tb, int64_t ik, const char* sk, int32_t* 
 	return -1;
 }
 
-static inline int32_t find_key_index(table* tb, int64_t ik, const char* sk) {
+static inline int32_t find_key_index(qxtable* tb, int64_t ik, const char* sk) {
 	if (tb->tt == QXT_TT_MAP) {
 		int32_t idx = _map_field_index(tb, ik, sk, NULL, false);
 		if (idx >= 0)
@@ -324,7 +289,7 @@ static inline int32_t find_key_index(table* tb, int64_t ik, const char* sk) {
 	return -1;
 }
 
-static inline int32_t find_map_insert_index(table* tb, int64_t ik, const char* sk) {
+static inline int32_t find_map_insert_index(qxtable* tb, int64_t ik, const char* sk) {
 	assert(tb->tt == QXT_TT_MAP);
 	int32_t ins_idx = -1;
 	int32_t idx = _map_field_index(tb, ik, sk, &ins_idx, true);
@@ -332,19 +297,19 @@ static inline int32_t find_map_insert_index(table* tb, int64_t ik, const char* s
 	return ins_idx;
 }
 
-static inline void set_value_type(table* tb, int32_t idx, uint8_t tv) {
+static inline void set_value_type(qxtable* tb, int32_t idx, uint8_t tv) {
 	assert(idx >= 0 && idx < tb->size);
 	uint8_t tk = get_kv_type(tb, idx) >> 4;
 	*get_kv_typep(tb, idx) = (tk << 4) | tv;
 	assert(get_value_type_by_index(tb, idx) == tv);
 }
 
-static inline void set_kv_type(table* tb, int32_t idx, uint8_t kv_type) {
+static inline void set_kv_type(qxtable* tb, int32_t idx, uint8_t kv_type) {
 	assert(idx >= 0 && idx < tb->size);
 	*get_kv_typep(tb, idx) = kv_type;
 }
 
-static inline void insert_array_value(table* tb, int64_t ik, int32_t tv, table_value* value) {
+static inline void insert_array_value(qxtable* tb, int64_t ik, int32_t tv, qxtable_value* value) {
 	uint8_t tt = tb->tt;
 	assert(tt != QXT_TT_MAP);
 	assert(ik > 0 && ik <= tb->size);
@@ -363,7 +328,7 @@ static inline void insert_array_value(table* tb, int64_t ik, int32_t tv, table_v
 	}
 }
 
-static void insert_map_value(table* tb, int64_t ik, const char* sk, uint8_t tv, table_value* value) {
+static void insert_map_value(qxtable* tb, int64_t ik, const char* sk, uint8_t tv, qxtable_value* value) {
 	assert(tb->tt == QXT_TT_MAP);
 	assert(tv != QXT_TNIL);
 
@@ -375,7 +340,7 @@ static void insert_map_value(table* tb, int64_t ik, const char* sk, uint8_t tv, 
 	if (move_size > 0) {
 		uint8_t* type_data = get_kv_typep(tb, current_size - 1);
 		memmove(type_data - 1, type_data, move_size);
-		table_node* node = get_table_node_element(tb, idx);
+		qxtable_node* node = get_table_node_element(tb, idx);
 		memmove(node + 1, node, move_size * sizeof(*node));
 	}
 
@@ -390,7 +355,7 @@ static void insert_map_value(table* tb, int64_t ik, const char* sk, uint8_t tv, 
 	get_table_node_element(tb, idx)->iv = value->iv;
 }
 
-static inline int32_t push_key_by_index(lua_State *L, table* tb, int32_t idx) {
+static inline int32_t push_key_by_index(lua_State *L, qxtable* tb, int32_t idx) {
 	assert(idx >= 0 && idx < tb->size);
 	int64_t ik = 0;
 	const char* sk = NULL;
@@ -405,7 +370,7 @@ static inline int32_t push_key_by_index(lua_State *L, table* tb, int32_t idx) {
 	return 1;
 }
 
-static int32_t push_value(lua_State *L, uint8_t tv, table_value* value) {
+static int32_t push_value(lua_State *L, uint8_t tv, qxtable_value* value) {
 	switch (tv) {
 		case QXT_TINTEGER: {
 			lua_pushinteger(L, value->iv);
@@ -435,15 +400,15 @@ static int32_t push_value(lua_State *L, uint8_t tv, table_value* value) {
 	return 1;
 }
 
-static inline int32_t push_value_by_index(lua_State *L, table* tb, int32_t idx) {
+static inline int32_t push_value_by_index(lua_State *L, qxtable* tb, int32_t idx) {
 	assert(idx >= 0 && idx < tb->size);
-	table_value value;
+	qxtable_value value;
 	uint8_t tv = get_value_by_index(tb, idx, &value);
 	assert(tv != QXT_TNIL);
 	return push_value(L, tv, &value);
 }
 
-static bool table_equal(table* tb1, table* tb2) {
+static bool table_equal(qxtable* tb1, qxtable* tb2) {
 	assert(tb1 != tb2);
 
 	uint8_t tt = tb1->tt;
@@ -468,7 +433,7 @@ static bool table_equal(table* tb1, table* tb2) {
 	
 	void* elem_ptr = tb1 + 1;
 	if (tt == QXT_TT_MAP) {
-		if (memcmp(elem_ptr, get_table_node_element(tb2, 0), size*sizeof(table_node)) != 0) {
+		if (memcmp(elem_ptr, get_table_node_element(tb2, 0), size*sizeof(qxtable_node)) != 0) {
 			return false;
 		}
 	}
@@ -478,7 +443,7 @@ static bool table_equal(table* tb1, table* tb2) {
 		}
 	}
 	else if (tt == QXT_TT_ARRAY) {
-		if (memcmp(elem_ptr, get_table_array_element(tb2, 0), size*sizeof(table_value)) != 0) {
+		if (memcmp(elem_ptr, get_table_array_element(tb2, 0), size*sizeof(qxtable_value)) != 0) {
 			return false;
 		}
 	}
@@ -489,26 +454,29 @@ static bool table_equal(table* tb1, table* tb2) {
 	return true;
 }
 
-static inline table* find_node_table(table* tb, uint32_t h) {
+static inline qxtable* find_node_table(qxtable* tb, uint32_t h) {
 	uint32_t idx = h % TABLE_HNODE_SIZE;
-	table_hnode* node = &g_ctx.table_hnode[idx];
+	qxtable_hnode* node = &g_ctx.qxtable_hnode[idx];
 	int32_t i;
-	for (i = 0; i < node->size; ++i) {
-		if (h == node->hash[i] && table_equal(tb, node->array[i])) {
-			return node->array[i];
+	for (i = 0; i < node->array.size; ++i) {
+		if (h == *(uint32_t*)qbarray_get(&node->harray, i)) {
+			qxtable* cache = *(qxtable**)qbarray_get(&node->array, i);
+			if (table_equal(tb, cache)) {
+				return cache;
+			}
 		} 
 	}
 	return NULL;
 }
 
 static inline int32_t table_mem_size(int32_t size, uint8_t tt) {
-	int32_t mem_size = size + sizeof(table);
+	int32_t mem_size = size + sizeof(qxtable);
 	if (size > 0) {
 		if (tt == QXT_TT_MAP) {
-			mem_size += sizeof(table_node) * size;
+			mem_size += sizeof(qxtable_node) * size;
 		}
 		else if (tt == QXT_TT_ARRAY) {
-			mem_size += sizeof(table_value) * size;
+			mem_size += sizeof(qxtable_value) * size;
 		}
 		else if (tt == QXT_TT_I32ARRAY) {
 			mem_size += sizeof(int32_t) * size;
@@ -520,29 +488,29 @@ static inline int32_t table_mem_size(int32_t size, uint8_t tt) {
 	return mem_size;
 }
 
-static inline void shallow_free_table(table* tb) {
-	void* mem = get_table_raw_ptr(tb);
+static inline void shallow_free_table(qxtable* tb) {
+	void* p = get_table_raw_ptr(tb);
 	int32_t mem_size = table_mem_size(tb->size, tb->tt);
-	qxtable_free(mem, mem_size);
+	qxtable_free(p, mem_size);
 }
 
-static inline table* new_table(int32_t size, uint8_t tt) {
+static inline qxtable* new_table(int32_t size, uint8_t tt) {
 	int32_t mem_size = table_mem_size(size, tt);
-	table* tb = qxtable_malloc(mem_size);
+	qxtable* tb = qxtable_malloc(mem_size);
 	memset(tb, 0, mem_size);
-	tb = (table*)((uint8_t*)tb + size);
+	tb = (qxtable*)((uint8_t*)tb + size);
 	tb->tt = tt;
 	tb->size = size;
 	return tb;
 }
 
-static table* convert_table(lua_State *L, int32_t* rh) {
+static qxtable* convert_table(lua_State *L, int32_t* rh) {
 	uint8_t tt = 0;
 	int32_t size = table_info(L, &tt);
 	uint32_t h = 0;
 	int32_t int32_num = 0;
 
-	table* tb = new_table(size, tt);
+	qxtable* tb = new_table(size, tt);
 
 	lua_pushnil(L);
 	while (lua_next(L, -2)) {
@@ -569,10 +537,10 @@ static table* convert_table(lua_State *L, int32_t* rh) {
 		}
 
 		int32_t tv = 0;
-		table_value value;
+		qxtable_value value;
 
-		int32_t lua_vtype = lua_type(L, -1);
-		switch (lua_vtype) {
+		int32_t ltv = lua_type(L, -1);
+		switch (ltv) {
 			case LUA_TNUMBER: {
 				if (lua_isinteger(L, -1)) {
 					tv = QXT_TINTEGER;
@@ -604,7 +572,7 @@ static table* convert_table(lua_State *L, int32_t* rh) {
 			case LUA_TTABLE: {
 				tv = QXT_TTABLE;
 				int32_t sub_hash = 0;
-				table* tb = convert_table(L, &sub_hash);
+				qxtable* tb = convert_table(L, &sub_hash);
 				value.tv = tb;
 				h += sub_hash;
 				h *= 0x01000193;
@@ -629,7 +597,7 @@ static table* convert_table(lua_State *L, int32_t* rh) {
 
 	if (size > 0 && tt == QXT_TT_ARRAY) {
 		if (int32_num == size) {
-			table* new_tb = new_table(size, QXT_TT_I32ARRAY);
+			qxtable* new_tb = new_table(size, QXT_TT_I32ARRAY);
 			int32_t i;
 			for (i = 0; i < size; ++i) {
 				*get_kv_typep(new_tb, i) = get_kv_type(tb, i);
@@ -642,24 +610,16 @@ static table* convert_table(lua_State *L, int32_t* rh) {
 
 	assert(get_current_size(tb) == tb->size);
 
-	table* cache = find_node_table(tb, h);
+	qxtable* cache = find_node_table(tb, h);
 	if (cache) {
 		shallow_free_table(tb);
 		tb = cache;
 	}
 	else {
 		uint32_t idx = h % TABLE_HNODE_SIZE;
-		table_hnode* node = &g_ctx.table_hnode[idx];
-		if (node->size >= node->cap) {
-			int32_t old_cap = node->cap;
-			node->cap = node->cap + 2;
-			node->hash = qxtable_realloc(node->hash, old_cap*sizeof(*node->hash), node->cap*sizeof(*node->hash));
-			node->array = qxtable_realloc(node->array, old_cap*sizeof(*node->array), node->cap*sizeof(*node->array));
-		}
-		assert(node->size < node->cap);
-		node->hash[node->size] = h;
-		node->array[node->size] = tb;
-		++node->size;
+		qxtable_hnode* node = &g_ctx.qxtable_hnode[idx];
+		qbarray_push_back(&node->harray, &h);
+		qbarray_push_back(&node->array, &tb);
 	}
 
 	if (rh) {
@@ -687,7 +647,7 @@ static inline void save_config(config* ncfg) {
 }
 
 static int32_t lindex(lua_State *L) {
-	table* tb = lua_touserdata(L, 1);
+	qxtable* tb = lua_touserdata(L, 1);
 	if (!tb) {
 		return luaL_error(L, "Invalid userdata");
 	}
@@ -725,7 +685,7 @@ static int32_t lindex(lua_State *L) {
 }
 
 static int32_t llen(lua_State *L) {
-	table* tb = lua_touserdata(L, 1);
+	qxtable* tb = lua_touserdata(L, 1);
 	if (!tb) {
 		return luaL_error(L, "Invalid userdata");
 	}
@@ -751,7 +711,7 @@ static int32_t llen(lua_State *L) {
 }
 	
 static int32_t lnext(lua_State *L) {
-	table* tb = lua_touserdata(L, 1);
+	qxtable* tb = lua_touserdata(L, 1);
 	if (!tb) {
 		return luaL_error(L, "Invalid userdata");
 	}
@@ -782,13 +742,131 @@ static int32_t lnext(lua_State *L) {
 	return 0;
 }
 
+static bool write_table_string(qxtable* tb, tostring_encoder* encoder) {
+	int32_t size = tb->size;
+	uint8_t tt = tb->tt;
+
+	write_byte(encoder, tt);
+	write_uinteger(encoder, size);
+
+	if (size == 0) {
+		return true;
+	}
+
+	if (tt == QXT_TT_I32ARRAY) {
+		void* p = get_table_raw_ptr(tb);
+		write_buf(encoder, p, table_mem_size(size, tt));
+		return true;
+	}
+
+	uint8_t* td = get_kv_typep(tb, size - 1);
+	write_buf(encoder, td, size);
+
+	if (tt == QXT_TT_MAP) {
+		int32_t i;
+		for (i = 0; i < size; ++i) {
+			int64_t ik = 0;
+			const char* sk = NULL;
+			uint8_t tk = get_key_by_index(tb, i, &ik, &sk);
+			if (tk == QXT_TSTRING) {
+				int32_t len = (int32_t)strlen(sk);
+				write_uinteger(encoder, len);
+				write_buf(encoder, sk, len);
+			}
+			else {
+				write_integer(encoder, ik);
+			}
+		}
+	}
+
+	int32_t i;
+	for (i = 0; i < size; ++i) {
+		qxtable_value value;
+		uint8_t tv = get_value_by_index(tb, i, &value);
+		switch (tv) {
+			case QXT_TINTEGER:
+				write_integer(encoder, value.iv);
+				break;
+			case QXT_TNUMBER:
+				write_buf(encoder, &value.dv, sizeof(double));
+				break;
+			case QXT_TBOOLEAN:
+				write_byte(encoder, value.bv ? 1 : 0);
+				break;
+			case QXT_TSTRING: {
+				int32_t len = (int32_t)strlen(value.sv);
+				write_uinteger(encoder, len);
+				write_buf(encoder, value.sv, len);
+				break;
+			}
+			case QXT_TTABLE:
+				if (!write_table_string(value.tv, encoder)) {
+					return false;
+				}
+				break;
+			default:
+				return false;
+		}
+	}
+
+	return true;
+}
+
+static int32_t ltostring(lua_State *L) {
+	qxtable* tb = lua_touserdata(L, 1);
+	if (!tb) {
+		return luaL_error(L, "Invalid userdata");
+	}
+	
+	tostring_encoder encoder;
+	memset(&encoder, 0, sizeof(encoder));
+	if (!write_table_string(tb, &encoder)) {
+		if (encoder.buffer) {
+			free(encoder.buffer);
+		}
+		luaL_error(L, "tostring error");
+		return 0;
+	}
+
+	assert(encoder.buffer);
+	lua_pushlstring(L, encoder.buffer, encoder.write_ptr);
+	free(encoder.buffer);
+	
+	return 1;
+}
+
+static int32_t string_compare(const void* a, const void* b) {
+    return strcmp(*(const char**)a, *(const char**)b);
+}
+
+static void qxtable_init() {
+	assert(!g_ctx.inited);
+	g_ctx.inited = true;
+
+	int32_t i;
+	for (i=0; i<STRING_HNODE_SIZE; ++i) {
+		string_node* node = &g_ctx.str_hnode[i];
+		qbarray_init(&node->array, sizeof(const char*), 2, string_compare);
+	}
+
+	for (i=0; i<TABLE_HNODE_SIZE; ++i) {
+		qxtable_hnode* node = &g_ctx.qxtable_hnode[i];
+		qbarray_init(&node->harray, sizeof(uint32_t), 2, NULL);
+		qbarray_init(&node->array, sizeof(qxtable*), 2, NULL);
+	}
+}
+
 static int32_t lupdate(lua_State *L) {
+	if (!g_ctx.inited) {
+		qxtable_init();
+	}
+
 	config* cfg = NULL;
 	
 	lua_pushnil(L);
 	while (lua_next(L, -2)) {
 		const char* name = lua_tostring(L, -2);
-		table* tb = convert_table(L, NULL);
+		qxtable* tb = convert_table(L, NULL);
 		config* ncfg = qxtable_malloc(sizeof(*ncfg));
 		ncfg->name = string_cache(name);
 		ncfg->tb = tb;
@@ -833,13 +911,14 @@ static int32_t lmemory(lua_State *L) {
 int32_t luaopen_qxtable_core(lua_State *L) {
 	luaL_checkversion(L);
 	luaL_Reg l[] = {
-		{ "index",		lindex	},
-		{ "len",		llen	},
-		{ "next",		lnext	},
-		{ "update",		lupdate	},
-		{ "reload",		lreload	},
-		{ "memory",		lmemory	},
-		{ NULL,			NULL 	},
+		{ "index",		lindex		},
+		{ "len",		llen		},
+		{ "next",		lnext		},
+		{ "tostring",	ltostring	},
+		{ "update",		lupdate		},
+		{ "reload",		lreload		},
+		{ "memory",		lmemory		},
+		{ NULL,			NULL 		},
 	};
 	luaL_newlib(L, l);
 	return 1;
