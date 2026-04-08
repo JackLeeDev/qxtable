@@ -10,7 +10,7 @@
 
 //spinlock
 typedef volatile int32_t spinlock_t;
-#define spin_lock(ptr) while (__sync_lock_test_and_set(ptr, 1))
+#define spin_lock(ptr) while(__sync_lock_test_and_set(ptr, 1)){}
 #define spin_trylock(ptr) __sync_lock_test_and_set(ptr, 1)==0
 #define spin_unlock(ptr) __sync_lock_release(ptr)
 
