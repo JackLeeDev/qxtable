@@ -88,7 +88,7 @@ typedef struct tostring_encoder {
 typedef struct config_context {
 	config* cfg;
 	string_node str_hnode[STRING_HNODE_SIZE];
-	qxtable_hnode qxtable_hnode[TABLE_HNODE_SIZE];
+	qxtable_hnode tb_hnode[TABLE_HNODE_SIZE];
 	size_t mem_size;
 	spinlock_t lock;
 	bool inited;
@@ -456,7 +456,7 @@ static bool table_equal(qxtable* tb1, qxtable* tb2) {
 
 static inline qxtable* find_node_table(qxtable* tb, uint32_t h) {
 	uint32_t idx = h % TABLE_HNODE_SIZE;
-	qxtable_hnode* node = &g_ctx.qxtable_hnode[idx];
+	qxtable_hnode* node = &g_ctx.tb_hnode[idx];
 	int32_t i;
 	for (i = 0; i < node->array.size; ++i) {
 		if (h == *(uint32_t*)qbarray_get(&node->harray, i)) {
@@ -617,7 +617,7 @@ static qxtable* convert_table(lua_State *L, int32_t* rh) {
 	}
 	else {
 		uint32_t idx = h % TABLE_HNODE_SIZE;
-		qxtable_hnode* node = &g_ctx.qxtable_hnode[idx];
+		qxtable_hnode* node = &g_ctx.tb_hnode[idx];
 		qbarray_push_back(&node->harray, &h);
 		qbarray_push_back(&node->array, &tb);
 	}
@@ -839,7 +839,7 @@ static int32_t string_compare(const void* a, const void* b) {
     return strcmp(*(const char**)a, *(const char**)b);
 }
 
-static void qxtable_init() {
+static void g_ctx_init() {
 	assert(!g_ctx.inited);
 	g_ctx.inited = true;
 
@@ -850,7 +850,7 @@ static void qxtable_init() {
 	}
 
 	for (i=0; i<TABLE_HNODE_SIZE; ++i) {
-		qxtable_hnode* node = &g_ctx.qxtable_hnode[i];
+		qxtable_hnode* node = &g_ctx.tb_hnode[i];
 		qbarray_init(&node->harray, sizeof(uint32_t), 2, NULL);
 		qbarray_init(&node->array, sizeof(qxtable*), 2, NULL);
 	}
@@ -858,7 +858,7 @@ static void qxtable_init() {
 
 static int32_t lupdate(lua_State *L) {
 	if (!g_ctx.inited) {
-		qxtable_init();
+		g_ctx_init();
 	}
 
 	config* cfg = NULL;

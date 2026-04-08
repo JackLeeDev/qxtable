@@ -10,22 +10,22 @@ local c_index = c.index
 local c_next = c.next
 local c_len = c.len
 
-local cache_tables = {}
+local cache_config = {}
 local meta = {}
 local weak_meta = {__mode = "v"}
 
 local _M = {}
 
 local function wrap_root(name, ud)
-    return setmetatable({__xt = assert(ud), __name = name}, meta)
+    return setmetatable({__ud = assert(ud), __name = name}, meta)
 end
 
 local function wrap_table(ud)
-    return setmetatable({__xt = assert(ud)}, meta)
+    return setmetatable({__ud = assert(ud)}, meta)
 end
 
 local function qxtable_next(t, k)
-    local nextk,nextv,nextud = c_next(t.__xt, k)
+    local nextk,nextv,nextud = c_next(t.__ud, k)
     if nextud then
         return nextk,t[nextk]
     else
@@ -34,7 +34,7 @@ local function qxtable_next(t, k)
 end
 
 meta.__index = function(t, k)
-    local v,ud = c_index(t.__xt, k)
+    local v,ud = c_index(t.__ud, k)
     if ud then
         local value = wrap_table(ud)
         rawset(t, k, value)
@@ -45,11 +45,11 @@ meta.__index = function(t, k)
 end
 
 meta.__newindex = function(t, k, v)
-    error("__newindex is not allowed")
+    error("Cannot modify a read-only table")
 end
 
 meta.__len = function(t)
-    return c_len(t.__xt)
+    return c_len(t.__ud)
 end
 
 meta.__pairs = function(t)
@@ -67,15 +67,27 @@ end
 function _M.reload()
     local ud_list = c.reload()
     for name,ud in pairs(ud_list) do
-        local cache = cache_tables[name]
-        if not cache or cache.__xt ~= ud then
-            cache_tables[name] = wrap_root(name, ud)
+        local cache = cache_config[name]
+        if not cache or cache.__ud ~= ud then
+            cache_config[name] = wrap_root(name, ud)
         end
     end
 end
 
-function _M.find(name)
-    return cache_tables[name]
+function _M.find(name, ...)
+    local conf = cache_config[name]
+    if not conf then
+        return
+    end
+    local val = conf
+    local n = select("#", ...)
+    for i =1,n do
+        val = val[select(i, ...)]
+        if val == nil then
+            return nil
+        end
+    end
+    return val
 end
 
 function _M.update(confs)
@@ -89,7 +101,7 @@ end
 
 function _M.md5(t)
     local md5 = require "md5"
-    return md5.sumhexa(c.tostring(t.__xt))
+    return md5.sumhexa(c.tostring(t.__ud))
 end
 
 function _M.memory()
@@ -97,11 +109,11 @@ function _M.memory()
 end
 
 function _M.gc()
-    for _,cache in pairs(cache_tables) do
+    for _,cache in pairs(cache_config) do
         setmetatable(cache, weak_meta)
     end
     collectgarbage("collect")
-    for _,cache in pairs(cache_tables) do
+    for _,cache in pairs(cache_config) do
         setmetatable(cache, meta)
     end
 end
