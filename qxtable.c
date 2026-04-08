@@ -250,7 +250,7 @@ static inline int32_t key_compare(int64_t ik1, const char* sk1, int64_t ik2, con
 		return sk2 ? strcmp(sk1, sk2) : 1;
 	}
 	else {
-		return sk2 ? -1 : ik1 - ik2;
+		return sk2 ? -1 : (ik1 > ik2) ? 1 : (ik1 < ik2) ? -1 : 0;
 	}
 }
 
@@ -553,7 +553,7 @@ static qxtable* convert_table(lua_State *L, int32_t* rh) {
 				else {
 					tv = QXT_TNUMBER;
 					value.dv = lua_tonumber(L, -1);
-					h = (int32_t)value.dv;
+					h += (int32_t)value.dv;
 				}
 				break;
 			}
@@ -732,7 +732,11 @@ static int32_t lnext(lua_State *L) {
 	}
 
 	if (next_index < 0) {
-		next_index = find_key_index(tb, ik, sk) + 1;
+		int32_t idx = find_key_index(tb, ik, sk);
+		if (idx < 0) {
+			return 0;
+		}
+		next_index = idx + 1;
 	}
 	if (next_index >= 0 && next_index < tb->size) {
 		push_key_by_index(L, tb, next_index);
